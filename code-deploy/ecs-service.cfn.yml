@@ -1,0 +1,235 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Adds resources to deploy an app through Fargate
+
+Parameters:
+  FargateStackName:
+    Type: String
+    Description: Fargate stack ID after creating an ECS cluster
+  LoadBalancerName:
+    Type: String
+    Description: Elastic load balancer name
+  AppName:
+    Type: String
+    Description: App name. Include -dev in the app name if you want to create app-name-dev app in ecs
+  ProdListenerArn:
+    Type: String
+    Description: Prod listener to create lister rule for prod traffic
+  TestListenerArn:
+    Type: String
+    Description: Test listener to hook a target group and routing health check traffic
+  ProdListenerRulePriority:
+    Type: Number
+    Description: Prod listener rule priority
+    MinValue: 1
+    MaxValue: 50000
+  TestListenerRulePriority:
+    Type: Number
+    Description: Test listener rule priority
+    MinValue: 1
+    MaxValue: 50000
+
+Resources:
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AppName} Security Group to Allow ALB"
+      GroupName: !Sub "${AppName}-sg"
+      VpcId:
+        Fn::ImportValue:
+          !Sub ${FargateStackName}-Vpc
+      SecurityGroupIngress:
+        - Description: "Traffic from ALB HTTP"
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId:
+            Fn::ImportValue:
+              !Sub ${FargateStackName}-AlbSecurityGroup
+        - Description: "Traffic from ALB HTTPS"
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId:
+            Fn::ImportValue:
+              !Sub ${FargateStackName}-AlbSecurityGroup
+  AppTargetGroup1:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 300
+      HealthCheckPath: "/ping"
+      HealthCheckTimeoutSeconds: 120
+      HealthyThresholdCount: 2
+      Name: !Sub "${AppName}-1"
+      Port: 80
+      Protocol: HTTP
+      TargetType: ip
+      UnhealthyThresholdCount: 2
+      VpcId:
+        Fn::ImportValue:
+          !Sub ${FargateStackName}-Vpc
+  AppTargetGroup2:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 300
+      HealthCheckPath: "/ping"
+      HealthCheckTimeoutSeconds: 120
+      HealthyThresholdCount: 2
+      Name: !Sub "${AppName}-2"
+      Port: 80
+      Protocol: HTTP
+      TargetType: ip
+      UnhealthyThresholdCount: 2
+      VpcId:
+        Fn::ImportValue:
+          !Sub ${FargateStackName}-Vpc
+  AppProdListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup1
+      Conditions:
+        - Field: host-header
+          HostHeaderConfig:
+            Values: [!Sub "${AppName}.${AWS::AccountId}.internal.monsanto.net"]
+      ListenerArn: !Ref ProdListenerArn
+      Priority: !Ref ProdListenerRulePriority
+  AppTestListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup2
+      Conditions:
+        - Field: host-header
+          HostHeaderConfig:
+            Values: [!Sub "${AppName}.${AWS::AccountId}.internal.monsanto.net"]
+      ListenerArn: !Ref TestListenerArn
+      Priority: !Ref TestListenerRulePriority
+  AppTaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/fargate/${AppName}"
+      RetentionInDays: 180
+  AppTaskIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AppName}-task-execution-role
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - "ecs-tasks.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+  AppTaskDefinition:
+    DependsOn:
+      - AppTaskLogGroup
+      - AppTaskIamRole
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      NetworkMode: awsvpc
+      Memory: '512'
+      Cpu: '256'
+      TaskRoleArn: !GetAtt AppTaskIamRole.Arn
+      ExecutionRoleArn: !GetAtt AppTaskIamRole.Arn
+      ContainerDefinitions:
+        - LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub "/aws/fargate/${AppName}"
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          PortMappings:
+            - ContainerPort: 80
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/placeholder:latest
+          Essential: true
+          Name: !Ref AppName
+      Family: !Ref AppName
+      RequiresCompatibilities:
+        - FARGATE
+  AppService:
+    DependsOn:
+      - AppProdListenerRule
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Ref AppName
+      PlatformVersion: LATEST
+      LaunchType: FARGATE
+      DeploymentController:
+        Type: CODE_DEPLOY
+      LoadBalancers:
+        - ContainerName: !Ref AppName
+          ContainerPort: 80
+          TargetGroupArn: !Ref AppTargetGroup1
+      DesiredCount: 1
+      TaskDefinition: !Ref "AppTaskDefinition"
+      Cluster:
+        Fn::ImportValue:
+          !Sub ${FargateStackName}-Cluster
+      HealthCheckGracePeriodSeconds: 60
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - Ref: AppSecurityGroup
+          Subnets:
+            - Fn::ImportValue:
+                !Sub ${FargateStackName}-Subnet1
+            - Fn::ImportValue:
+                !Sub ${FargateStackName}-Subnet2
+  AppDns:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      Name: !Sub "${AppName}.${AWS::AccountId}.internal.monsanto.net."
+      HostedZoneName: !Sub "${AWS::AccountId}.internal.monsanto.net."
+      Type: A
+      AliasTarget:
+        DNSName:
+          Fn::Join:
+            - "."
+            - - dualstack
+              - Fn::ImportValue: !Sub ${FargateStackName}-DNSName
+        HostedZoneId:
+          Fn::ImportValue:
+            !Sub ${FargateStackName}-HostedZoneId
+  AppEcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref AppName
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "NoMoreThanOneDay",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 7
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+  CodeDeployApp:
+    DependsOn:
+      - AppService
+    Type: AWS::CodeDeploy::Application
+    Properties: 
+      ApplicationName: !Ref AppName
+      ComputePlatform: ECS

@@ -1,0 +1,81 @@
+version: 0.2
+env:
+  parameter-store:
+    NPME_AUTH_TOKEN: "/npme/auth-token"
+    VAULT_ROLE_ID: "/vault/role-id"
+    VAULT_SECRET_ID: "/vault/secret-id"
+phases:
+  install:
+    runtime-versions:
+      nodejs: 12.x
+    commands:
+      - npm config set registry https://registry.npmjs.org/
+      - npm config set @monsantoit:registry https://npm.platforms.engineering
+      - npm config set @kpia:registry=https://npm.platforms.engineering
+      - npm config set //npm.platforms.engineering/:_authToken $NPME_AUTH_TOKEN
+      - rm -rf package-lock.json
+      - npm i
+  pre_build:
+    commands:
+      - echo Running tests...!
+      - npm run test
+  build:
+    commands:
+      - echo Building artifacts...!
+      - npm run build
+      - echo Build completed...!
+  post_build:
+    commands:
+      - |
+       echo "Checking for deployment conditions...!"
+       echo
+       echo CODEBUILD_INITIATOR=$CODEBUILD_INITIATOR
+       echo CODEBUILD_WEBHOOK_EVENT=$CODEBUILD_WEBHOOK_EVENT
+       echo CODEBUILD_WEBHOOK_HEAD_REF=$CODEBUILD_WEBHOOK_HEAD_REF
+       echo CODEBUILD_SOURCE_VERSION=$CODEBUILD_SOURCE_VERSION
+       echo AWS_ENVIRONMENT=$AWS_ENVIRONMENT
+       echo
+
+       echo "Fetching Vault token...!"
+       VAULT_TOKEN=$(curl -s -H "Content-Type: application/json" \
+           -X POST -d \'{ "role_id": "\'$VAULT_ROLE_ID\'", "secret_id": "\'$VAULT_SECRET_ID\'" }\' \
+           https://vault.agro.services/v1/auth/approle/login | jq -r ".auth.client_token")
+
+       vault () {
+           echo $(echo $(curl -s -H "X-Vault-Token: $VAULT_TOKEN" -X GET https://vault.agro.services/v1/secret$1 | jq -r ".data"))
+       }
+
+       ssm_param () {  
+         echo $(echo $(aws ssm get-parameter --name "$1" --with-decryption) | jq -r ".Parameter.Value")
+       }
+
+       BRANCH=$CODEBUILD_WEBHOOK_HEAD_REF
+       if [ "${CODEBUILD_INITIATOR#*"standard-user/"}" != "$CODEBUILD_INITIATOR" ]; then
+         BRANCH=$CODEBUILD_SOURCE_VERSION
+         if [ "$AWS_ENVIRONMENT" = "nonprod" ]; then
+           if [ "$DEPLOY_ENV" != "dev" ] && [ "$DEPLOY_ENV" != "nonprod" ]; then
+             DEPLOY_ENV="dev"
+           fi
+         else
+           DEPLOY_ENV="prod"
+         fi
+       elif [ "$CODEBUILD_WEBHOOK_EVENT" = "PUSH" ] && [ "${CODEBUILD_WEBHOOK_HEAD_REF#*"refs/tags/"}" != "$CODEBUILD_WEBHOOK_HEAD_REF" ]; then
+         DEPLOY_ENV="prod"
+       elif [ "$CODEBUILD_WEBHOOK_EVENT" = "PUSH" ] && [ "$CODEBUILD_WEBHOOK_HEAD_REF" = "refs/heads/develop" ]; then
+         DEPLOY_ENV="nonprod"
+       elif [ "$CODEBUILD_WEBHOOK_EVENT" != "PUSH" ] && [ "$CODEBUILD_WEBHOOK_EVENT" != "PULL_REQUEST_MERGED" ] && [ "$CODEBUILD_WEBHOOK_HEAD_REF" != "refs/heads/develop" ] && [ "$CODEBUILD_WEBHOOK_HEAD_REF" != "refs/heads/master" ]; then
+         DEPLOY_ENV="dev"
+       fi
+
+       if [ "$DEPLOY_ENV" = "dev" ] || [ "$DEPLOY_ENV" = "nonprod" ] || [ "$DEPLOY_ENV" = "prod" ]; then
+         
+         . ./deploy.sh
+
+       echo
+       echo "|=====================================================================|"
+       echo "           Branch/Tag $BRANCH is deployed to $DEPLOY_ENV               "
+       echo "|=====================================================================|"
+
+       else
+         echo "The App deployment skipped, as no deployment condition met...!"
+       fi

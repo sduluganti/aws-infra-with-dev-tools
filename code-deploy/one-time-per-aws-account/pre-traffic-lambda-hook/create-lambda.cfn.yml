@@ -1,0 +1,42 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: A Lambda function to health check a container deployed by CodeDeploy before routing prod traffic and killing old revision
+
+Parameters:
+  FargateStackName:
+    Type: String
+    Description: Fargate stack ID after creating an ECS cluster
+  FunctionCode:
+    Type: String
+    Description: The Lambda function code if it is a single file
+
+Resources:
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub 'code-deploy pre-traffic lambda-hook sg. added to ALB'
+      GroupName: !Sub 'CodeDeploy pre-traffic lambda hook'
+      VpcId:
+        Fn::ImportValue: !Sub ${FargateStackName}-Vpc
+  PreTrafficHealthCheckLambda:
+    DependsOn:
+      - LambdaSecurityGroup
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 'code-deploy-pre-traffic-health-check-hook'
+      Description: Health check a container deployed by CodeDeploy before routing prod traffic and killing old revision
+      Code:
+        ZipFile: !Sub |
+          ${FunctionCode}
+      Timeout: 120
+      Handler: index.handler
+      Runtime: nodejs12.x
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/kpi-automation-lambda'
+      VpcConfig:
+        SecurityGroupIds:
+          - Ref: LambdaSecurityGroup
+        SubnetIds:
+          - Fn::ImportValue: !Sub ${FargateStackName}-Subnet1
+          - Fn::ImportValue: !Sub ${FargateStackName}-Subnet2
+      Environment:
+        Variables:
+          AWS_ACCOUNT_ID: !Sub ${AWS::AccountId}

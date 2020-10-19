@@ -1,0 +1,190 @@
+version: 0.2
+env:
+  parameter-store:
+    VAULT_ROLE_ID: "/vault/role-id"
+    VAULT_SECRET_ID: "/vault/secret-id"
+    NEXUS_USER: "/nexus-repo/user"
+    NEXUS_PASSWORD: "/nexus-repo/password"
+phases:
+  install:
+    runtime-versions:
+      java: corretto8
+    commands:
+      - echo Installing dependencies
+      - |
+       cd ~ && mkdir .sbt && cd -
+       cat > ~/.sbt/.credentials << EOF
+       realm=Sonatype Nexus Repository Manager
+       host=nexus.platforms.engineering
+       user=$NEXUS_USER
+       password=$NEXUS_PASSWORD
+       EOF
+      - sbt clean compile
+  pre_build:
+    commands:
+      - |
+       echo Fetching Vault token...!
+
+       VAULT_TOKEN=$(curl -s -H "Content-Type: application/json" \
+           -X POST -d \'{ "role_id": "\'$VAULT_ROLE_ID\'", "secret_id": "\'$VAULT_SECRET_ID\'" }\' \
+           https://vault.agro.services/v1/auth/approle/login | jq -r ".auth.client_token")
+
+      - |
+       echo Running tests...!
+       vault () {
+           echo $(echo $(curl -s -H "X-Vault-Token: $VAULT_TOKEN" -X GET https://vault.agro.services/v1/secret$1 | jq -r ".data"))
+       }
+       . ./scripts/codebuild-test.sh
+  build:
+    commands:
+      - echo Building artifacts...!
+      - sbt clean assembly
+      - echo Build completed...!
+  post_build:
+    commands:
+      - |
+       echo "Checking for deployment conditions...!"
+       echo
+       echo CODEBUILD_INITIATOR=$CODEBUILD_INITIATOR
+       echo CODEBUILD_WEBHOOK_EVENT=$CODEBUILD_WEBHOOK_EVENT
+       echo CODEBUILD_WEBHOOK_HEAD_REF=$CODEBUILD_WEBHOOK_HEAD_REF
+       echo CODEBUILD_SOURCE_VERSION=$CODEBUILD_SOURCE_VERSION
+       echo AWS_ENVIRONMENT=$AWS_ENVIRONMENT
+       echo
+
+       echo "Fetching Vault token...!"
+       vault () {
+           echo $(echo $(curl -s -H "X-Vault-Token: $VAULT_TOKEN" -X GET https://vault.agro.services/v1/secret$1 | jq -r ".data"))
+       }
+
+       ssm_param () {  
+         echo $(echo $(aws ssm get-parameter --name "$1" --with-decryption) | jq -r ".Parameter.Value")
+       }
+
+       BRANCH=$CODEBUILD_WEBHOOK_HEAD_REF
+       if [ "${CODEBUILD_INITIATOR#*"standard-user/"}" != "$CODEBUILD_INITIATOR" ]; then
+         BRANCH=$CODEBUILD_SOURCE_VERSION
+         if [ "$AWS_ENVIRONMENT" = "nonprod" ]; then
+           if [ "$DEPLOY_ENV" != "dev" ] && [ "$DEPLOY_ENV" != "nonprod" ]; then
+             DEPLOY_ENV="dev"
+           fi
+         else
+           DEPLOY_ENV="prod"
+         fi
+       elif [ "$CODEBUILD_WEBHOOK_EVENT" = "PUSH" ] && [ "${CODEBUILD_WEBHOOK_HEAD_REF#*"refs/tags/"}" != "$CODEBUILD_WEBHOOK_HEAD_REF" ]; then
+         DEPLOY_ENV="prod"
+       elif [ "$CODEBUILD_WEBHOOK_EVENT" = "PUSH" ] && [ "$CODEBUILD_WEBHOOK_HEAD_REF" = "refs/heads/develop" ]; then
+         DEPLOY_ENV="nonprod"
+       elif [ "$CODEBUILD_WEBHOOK_EVENT" != "PUSH" ] && [ "$CODEBUILD_WEBHOOK_EVENT" != "PULL_REQUEST_MERGED" ] && [ "$CODEBUILD_WEBHOOK_HEAD_REF" != "refs/heads/develop" ] && [ "$CODEBUILD_WEBHOOK_HEAD_REF" != "refs/heads/master" ]; then
+         DEPLOY_ENV="dev"
+       fi
+
+       if [ "$DEPLOY_ENV" = "dev" ] || [ "$DEPLOY_ENV" = "nonprod" ] || [ "$DEPLOY_ENV" = "prod" ]; then
+         
+       . ./deploy.sh
+
+       cat > Dockerfile << EOF
+       FROM openjdk:8-jre
+       RUN apt update
+       WORKDIR /
+       COPY target/$APP_NAME.jar $APP_NAME.jar
+       $(test -d "universal" && echo "COPY universal /")
+       EXPOSE 80
+       CMD ["java", "-jar", "$APP_NAME.jar"]
+       EOF
+
+       if [ "$DEPLOY_ENV" = "dev" ]; then
+         ENV_SUFFIX="-dev"
+         APP_NAME=$APP_NAME$ENV_SUFFIX
+       else
+         ENV_SUFFIX=""
+       fi
+
+       REPO_NAME=$(echo $(aws ecr describe-repositories --repository-names ${APP_NAME}) | jq -r ".repositories[0].repositoryName")
+       if [ "$REPO_NAME" != "$APP_NAME" ]; then
+         echo "The $DEPLOY_ENV environment does not exist for this project, so, exiting deployment...!"
+         exit 0
+       fi
+
+       echo Deploying $APP_NAME to $DEPLOY_ENV
+
+       echo Building the Docker image... 
+       docker build -t $APP_NAME:latest .
+       echo Pushing the Docker image...
+       $(aws ecr get-login --no-include-email --region $AWS_DEFAULT_REGION)
+       docker tag $APP_NAME:latest $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/$APP_NAME:latest
+       docker push $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/$APP_NAME:latest
+
+       CPU="$(echo $CONTAINER_DEFINITIONS | jq -r ".cpu")"
+       MEMORY="$(echo $CONTAINER_DEFINITIONS | jq -r ".memory")"
+       CONTAINER_ENV="$(echo $CONTAINER_DEFINITIONS | jq -r ".environment")"
+
+       cat > "task-definition.json" << EOF
+       {
+         "family": "$APP_NAME",
+         "cpu": "$CPU",
+         "memory": "$MEMORY",
+         "networkMode": "awsvpc",
+         "taskRoleArn": "arn:aws:iam::$AWS_ACCOUNT_ID:role/$APP_NAME-task-execution-role",
+         "executionRoleArn": "arn:aws:iam::$AWS_ACCOUNT_ID:role/$APP_NAME-task-execution-role",
+         "requiresCompatibilities": [
+           "FARGATE"
+         ],
+         "containerDefinitions": [
+           {
+             "name": "$APP_NAME",
+             "workingDirectory": "/",
+             "environment": $CONTAINER_ENV,
+             "image": "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$APP_NAME:latest",
+             "essential": true,
+             "logConfiguration": {
+               "logDriver": "awslogs",
+               "options": {
+                 "awslogs-group": "/aws/fargate/$APP_NAME",
+                 "awslogs-region": "$AWS_DEFAULT_REGION",
+                 "awslogs-stream-prefix": "ecs"
+               }
+             },
+             "portMappings": [
+               {
+                 "hostPort": 80,
+                 "protocol": "tcp",
+                 "containerPort": 80
+               }
+             ]
+           }
+         ]
+       }
+       EOF
+
+       cat > appspec.yaml << EOF
+       version: 0.0
+       Resources:
+         - TargetService:
+             Type: AWS::ECS::Service
+             Properties:
+               TaskDefinition: "<APP-TASK-DEFINITIOIN>"
+               LoadBalancerInfo:
+                 ContainerName: "$APP_NAME"
+                 ContainerPort: 80
+       Hooks:
+         - BeforeAllowTraffic: "code-deploy-pre-traffic-health-check-hook"
+       EOF
+
+       echo Calling ECS deploy...!
+
+       aws ecs deploy --service "$APP_NAME" \
+          --task-definition "task-definition.json" \
+          --codedeploy-appspec "appspec.yaml" \
+          --cluster "kpi-automation" \
+          --codedeploy-application "$APP_NAME" \
+          --codedeploy-deployment-group "$APP_NAME-ecs-blue-green"
+
+       echo
+       echo "|=====================================================================|"
+       echo "           Branch/Tag $BRANCH is deployed to $DEPLOY_ENV               "
+       echo "|=====================================================================|"
+
+       else
+         echo "The App deployment skipped, as no deployment condition met...!"
+       fi
